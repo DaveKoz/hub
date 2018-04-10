@@ -19,8 +19,11 @@
 #define UTXO_IMPORTER_H
 
 #include <QObject>
+#include <QSqlDatabase>
 
 class Tx;
+class FastBlock;
+class CBlockIndex;
 
 class Importer : public QObject
 {
@@ -33,9 +36,13 @@ public slots:
     void start();
 
 private:
-    void initDb();
+    bool initDb();
+    bool createTables();
+    void parseBlock(const CBlockIndex *index, FastBlock block);
 
-    void processTx(Tx tx, bool isCoinbase);
+    void processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock);
+
+    QSqlDatabase m_db;
 };
 
 #endif

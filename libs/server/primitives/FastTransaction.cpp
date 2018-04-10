@@ -57,6 +57,13 @@ CTransaction Tx::createOldTransaction() const
     return std::move(answer);
 }
 
+int64_t Tx::offsetInBlock(const FastBlock &block) const
+{
+    assert(m_data.isValid());
+    assert(block.data().isValid());
+    return m_data.begin() - block.data().begin();
+}
+
 Tx Tx::fromOldTransaction(const CTransaction &transaction, Streaming::BufferPool *pool)
 {
     CSizeComputer sc(0, 0);

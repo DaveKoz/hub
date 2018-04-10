@@ -19,9 +19,18 @@
 
 #include "Importer.h"
 
+#include <Logger.h>
+
 int main(int x, char **y)
 {
     QCoreApplication app(x, y);
+    app.setOrganizationName("flowee");
+    app.setOrganizationDomain("flowee.org");
+    app.setApplicationName("utxo");
+
+    QString logsconf = QStandardPaths::locate(QStandardPaths::AppConfigLocation, "logs.conf");
+    QString logFile = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/utxo.log";
+    Log::Manager::instance()->parseConfig(logsconf.toLocal8Bit().toStdString(), logFile.toLocal8Bit().toStdString());
 
     Importer importer;
     QTimer::singleShot(0, &importer, SLOT(start()));

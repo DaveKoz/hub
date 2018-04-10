@@ -28,11 +28,18 @@ find_package(Qt5Sql)
 include_directories(. ${LIBS_INCLUDES})
 
 set (UTXO_LIBS
-    flowee_utils
     flowee_server
+    flowee_utils
 
+    ${LEVELDB_LIBRARY}
+    ${SECP256K1_LIBRARY}
+    ${UNIVALUE_LIBRARY}
     ${OPENSSL_LIBRARIES}
     ${Boost_LIBRARIES}
+    ${ZMQ_LIBRARIES}
+    ${Event_LIBRARIES}
+    ${BERKELEY_DB_LIBRARIES}
+    ${MINIUPNP_LIBRARY}
     ${BOOST_THREAD_LIBRARY}
 )
 

@@ -20,42 +20,255 @@
 #include <primitives/FastTransaction.h>
 #include <primitives/FastBlock.h>
 #include <Logger.h>
+#include <BlocksDB.h>
+
+#include <QDir>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QCoreApplication>
+#include <chain.h>
+#include <chainparamsbase.h>
+#include <QVariant>
+#include <QDebug>
+
+namespace {
+quint64 longFromBytes(const Streaming::ConstBuffer &buf) {
+    assert(buf.size() >= 8);
+    // this is fine as long as you don't change your endiannes accessing the same DB
+    const quint64 *answer = reinterpret_cast<const quint64*>(buf.begin());
+    return answer[0] >> 1;
+}
+quint64 longFromHash(const uint256 &sha) {
+    const quint64 *answer = reinterpret_cast<const quint64*>(sha.begin());
+    return answer[0] >> 1;
+}
+}
 
 Importer::Importer(QObject *parent)
     : QObject(parent)
 {
+
 }
 
 void Importer::start()
 {
-    initDb();
-    /*
-     * open blocksDB
-     * use header-chain to walk through the blocks.
-     *
-     * for each block;
-     *   for each transaction;
-     *      processTx()
-     */
+    logInfo() << "Init DB";
+    if (!initDb()) {
+        QCoreApplication::exit(1);
+        return;
+    }
+
+    try {
+        SelectBaseParams(CBaseChainParams::MAIN);
+        Blocks::DB::createInstance(1000, false);
+        logInfo() << "Reading blocksDB";
+        Blocks::DB::instance()->CacheAllBlockInfos();
+        logInfo() << "Finding blocks...";
+        const auto &chain = Blocks::DB::instance()->headerChain();
+        CBlockIndex *index = chain.Genesis();
+        if (index == nullptr) {
+            logCritical() << "No blocks in DB. Not even genesis block!";
+            QCoreApplication::exit(2);
+            return;
+        }
+        int lastHeight = -1;
+        while(true) {
+            index = chain.Next(index); // we skip genesis, its not part of the utxo
+            if (! index)
+                break;
+            lastHeight = index->nHeight;
+            parseBlock(index, Blocks::DB::instance()->loadBlock(index->GetBlockPos()));
+        }
+        logCritical() << "Finished with block at height:" << lastHeight;
+    } catch (const std::exception &e) {
+        logFatal() << e;
+        QCoreApplication::exit(1);
+        return;
+    }
+    QCoreApplication::exit(0);
 }
 
-void Importer::initDb()
+bool Importer::initDb()
 {
-    // drops tables and create them
-    // and the indexes.
+    m_db = QSqlDatabase::addDatabase("QMYSQL");
+    if (!m_db.isValid()) {
+        logFatal() << "Unknown database-type. MYSQL. Missing QSql plugins?";
+        logCritical() << m_db.lastError().text();
+        return false;
+    }
+    m_db.setConnectOptions(QString("UNIX_SOCKET=%1").arg(QDir::homePath() + "/utxo-test/mysqld.sock"));
+    m_db.setDatabaseName("utxo");
+    m_db.setUserName("root");
+    m_db.setHostName("localhost");
+    if (m_db.isValid() && m_db.open()) {
+        return createTables();
+    } else {
+        logFatal() << "Failed opening the database-connection" << m_db.lastError().text();
+        return false;
+    }
 }
 
-void Importer::processTx(Tx tx, bool isCoinbase)
+bool Importer::createTables()
 {
-    /*
-     * for each input, do a select.
-     *   Check we actually have the utxo.
-     *       Throw if fail.
-     *   delete the utxo.
-     * for each output.
-     *   bulk insert utxos.
-     *
-     * ideally I return the amount of fee that this transaction generated.
-     */
-    logDebug() << tx.createHash();
+    QSqlQuery query(m_db);
+    query.exec("drop table utxo");
+
+    QString q("create table utxo ( "
+              "txid BIGINT, "			// the first 8 bytes of the (32-bytes) TXID (sha256)
+              "outx INTEGER, "			// output-index
+              "txid_rest VARBINARY(25), "// the rest of the txid
+             //  "amount BIGINT, " 		// the amount held in this utxo.
+              "offsetIB INTEGER, "		// byte-offset in block where the tx starts
+              "b_height INTEGER "		// block-height
+              // ", coinbase BOOLEAN" 	// true if this is a coinbase
+              ")");
+    if (!query.exec(q)) {
+        logFatal() << "Failed to create table:" << query.lastError().text();
+        return false;
+    }
+    if (!query.exec("create index utxo_basic on utxo (txid, outx)")) {
+        logFatal() << "Failed to create index:" << query.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+void Importer::parseBlock(const CBlockIndex *index, FastBlock block)
+{
+    if (index->nHeight % 10000 == 0)
+        logInfo() << "Parsing block" << index->nHeight << block.createHash();
+
+    block.findTransactions();
+    if (!m_db.transaction())
+        throw std::runtime_error("Need transaction aware DB");
+
+    try {
+        bool first = true;
+        for (auto tx : block.transactions()) {
+            processTx(index, tx, first, tx.offsetInBlock(block));
+            first = false;
+        }
+        m_db.commit();
+    } catch (const std::exception &e) {
+        m_db.rollback();
+        throw;
+    }
+}
+
+struct Input {
+    Streaming::ConstBuffer txid;
+    int index;
+};
+
+void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock)
+{
+     // TODO return the amount of fee that this transaction generated so we can 'validate' the coinbase.
+
+    std::list<Input> inputs;
+    int outputCount = 0;
+    QVariantList spendableOutputs;
+    {
+        Input curInput;
+        auto iter = Tx::Iterator(tx);
+        auto content = iter.next();
+        while (content != Tx::End) {
+            if (!isCoinbase && content == Tx::PrevTxHash) { // only read inputs for non-coinbase txs
+                curInput.txid = iter.byteData();
+                if (curInput.txid.size() != 32)
+                    throw std::runtime_error("Failed to understand PrevTxHash");
+                content = iter.next(Tx::PrevTxIndex);
+                if (content != Tx::PrevTxIndex)
+                    throw std::runtime_error("Failed to find PrevTxIndex");
+                curInput.index = iter.intData();
+                inputs.push_back(curInput);
+            }
+            else if (content == Tx::OutputValue) {
+                if (iter.longData() > 0)
+                    spendableOutputs.append(QVariant(outputCount));
+                outputCount++;
+            }
+            content = iter.next();
+        }
+    }
+
+    if (!inputs.empty()){
+        QSqlQuery selectQuery(m_db);
+        // selectQuery.prepare("select txid_rest, offsetIB, b_height from utxo where txid=:txid and outx=:index");
+        selectQuery.prepare("select txid_rest from utxo where txid=:txid and outx=:index");
+        QSqlQuery delQuery(m_db);
+        delQuery.prepare("delete from utxo where txid=:txid and outx=:index and txid_rest=:txid2");
+        for (auto input : inputs) {
+            selectQuery.bindValue(":txid", QVariant(longFromBytes(input.txid)));
+            selectQuery.bindValue(":index", input.index);
+            if (!selectQuery.exec())
+                throw std::runtime_error(selectQuery.lastError().text().toStdString());
+
+            bool found = false;
+            QByteArray partialTxId(input.txid.begin() + 7, 25);
+            while (selectQuery.next()) { // we may get multiple results in case of a short-txid collision.
+                if (selectQuery.value(0) == partialTxId) { // got it!
+                    found = true;
+
+                    // TODO
+                    // we could use offset-in-block to read the actual transaction so we can
+                    // dig out the amount and the script.
+
+                    // TODO we could use the b_height to validate if this is a mature coin (may need an additional boolean 'iscoinbase' in DB)
+
+                    break;
+                }
+            }
+            if (!found) {
+                // logFatal() << "block" << index->nHeight << "tx" << tx.createHash() << "tries to find input" << HexStr(input.txid) << input.index;
+                // logInfo() << "    " << QString::number(longFromBytes(input.txid), 16).toStdString();
+                throw std::runtime_error("UTXO not found");
+            }
+
+            // now delete the row we just spent
+            delQuery.bindValue(":txid", QVariant(longFromBytes(input.txid)));
+            delQuery.bindValue(":index", input.index);
+            delQuery.bindValue(":txid2", partialTxId);
+            if (!delQuery.exec())
+                throw std::runtime_error("Failed to run the utxo delete query");
+            if (delQuery.numRowsAffected() != 1) {
+                logFatal() << "Delete UTXO ended up removing" << delQuery.numRowsAffected() << "rows. Should always be 1.";
+                throw std::runtime_error("UTXO delete didn't respond as expected");
+            }
+#if 0
+            // check the delete actually worked.
+            if (!selectQuery.exec())
+                throw std::runtime_error(selectQuery.lastError().text().toStdString());
+            if (selectQuery.size() > 0)
+                logFatal() << "Still one in the UTXO!";
+            while (selectQuery.next()) {
+                logFatal() << selectQuery.value(0).toString();
+            }
+#endif
+        }
+    }
+
+    if (spendableOutputs.isEmpty())
+        return;
+
+    QString insert("insert into utxo (txid, outx, txid_rest, offsetIB, b_height) VALUES (%1, ?, ?, %2, %3)");
+    const uint256 myHash = tx.createHash();
+    insert = insert.arg(longFromHash(myHash));
+    insert = insert.arg(offsetInBlock);
+    insert = insert.arg(index->nHeight);
+
+    // ok, this looks a bit ugly. I don't know how to insert a byte-array in sql, so I'll just do this the hard way for now.
+    const QByteArray txid2(reinterpret_cast<const char*>(myHash.begin()) + 7, 25);
+    QVariantList txid2_list;
+    for (int i = 0; i < spendableOutputs.length(); ++i) {
+        txid2_list.append(txid2);
+        // logInfo() << "insert" << QString::number(longFromHash(myHash), 16).toStdString() << "/" << HexStr(txid2) << spendableOutputs.at(i).toInt();
+    }
+
+    QSqlQuery query(m_db);
+    query.prepare(insert);
+    query.addBindValue(spendableOutputs);
+    query.addBindValue(txid2_list);
+
+    if (!query.execBatch())
+        throw std::runtime_error(query.lastError().text().toStdString());
 }
