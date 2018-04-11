@@ -74,6 +74,7 @@ void Importer::start()
             QCoreApplication::exit(2);
             return;
         }
+        int nextStop = 10000;
         int lastHeight = -1;
         while(true) {
             index = chain.Next(index); // we skip genesis, its not part of the utxo
@@ -82,7 +83,8 @@ void Importer::start()
             lastHeight = index->nHeight;
             parseBlock(index, Blocks::DB::instance()->loadBlock(index->GetBlockPos()));
 
-            if (index->nHeight % 10000 == 0) {
+            if (m_txCount.load() > nextStop) {
+                nextStop = m_txCount.load() + 25000;
                 logCritical() << "Finished blocks 0..." << index->nHeight << ", tx count:" << m_txCount.load();
                 logCritical() << "  parseBlocks" << m_parse.load() << "ms";
                 logCritical() << "       select" << m_selects.load() << "ms";
@@ -104,6 +106,7 @@ void Importer::start()
 
 bool Importer::initDb()
 {
+#if 0
     m_db = QSqlDatabase::addDatabase("QMYSQL");
     if (!m_db.isValid()) {
         logFatal() << "Unknown database-type. MYSQL. Missing QSql plugins?";
@@ -113,6 +116,16 @@ bool Importer::initDb()
     m_db.setConnectOptions(QString("UNIX_SOCKET=%1").arg(QDir::homePath() + "/utxo-test/mysqld.sock"));
     m_db.setDatabaseName("utxo");
     m_db.setUserName("root");
+#else
+    m_db = QSqlDatabase::addDatabase("QPSQL");
+    if (!m_db.isValid()) {
+        logFatal() << "Unknown database-type. PSQL. Missing QSql plugins?";
+        logCritical() << m_db.lastError().text();
+        return false;
+    }
+    m_db.setDatabaseName("utxo");
+    m_db.setUserName("utxo");
+#endif
     m_db.setHostName("localhost");
     if (m_db.isValid() && m_db.open()) {
         return createTables();
@@ -130,12 +143,15 @@ bool Importer::createTables()
     QString q("create table utxo ( "
               "txid BIGINT, "			// the first 8 bytes of the (32-bytes) TXID (sha256)
               "outx INTEGER, "			// output-index
-              "txid_rest VARBINARY(25), "// the rest of the txid
-             //  "amount BIGINT, " 		// the amount held in this utxo.
+              // "txid_rest VARBINARY(25), "// the rest of the txid     // mysql
+              "txid_rest bytea, "       // the rest of the txid         // postgresql
+              //  "amount BIGINT, " 		// the amount held in this utxo.
               "offsetIB INTEGER, "		// byte-offset in block where the tx starts
               "b_height INTEGER "		// block-height
               // ", coinbase BOOLEAN" 	// true if this is a coinbase
               ")");
+
+
     if (!query.exec(q)) {
         logFatal() << "Failed to create table:" << query.lastError().text();
         return false;
