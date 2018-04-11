@@ -45,6 +45,7 @@ private:
     QSqlDatabase m_db;
 
     QAtomicInt m_selects;
+    QAtomicInt m_filterTx;
     QAtomicInt m_inserts;
     QAtomicInt m_deletes;
     QAtomicInt m_parse;

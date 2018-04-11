@@ -33,16 +33,47 @@
 #include <QTime>
 
 namespace {
+/*
 quint64 longFromBytes(const Streaming::ConstBuffer &buf) {
     assert(buf.size() >= 8);
     // this is fine as long as you don't change your endiannes accessing the same DB
     const quint64 *answer = reinterpret_cast<const quint64*>(buf.begin());
     return answer[0] >> 1;
-}
+} */
 quint64 longFromHash(const uint256 &sha) {
     const quint64 *answer = reinterpret_cast<const quint64*>(sha.begin());
     return answer[0] >> 1;
 }
+
+struct Input {
+    uint256 txid;
+    int index;
+};
+
+std::list<Input> findInputs(Tx::Iterator &iter) {
+    std::list<Input> inputs;
+
+    Input curInput;
+    auto content = iter.next();
+    while (content != Tx::End) {
+        if (content == Tx::PrevTxHash) { // only read inputs for non-coinbase txs
+            if (iter.byteData().size() != 32)
+                throw std::runtime_error("Failed to understand PrevTxHash");
+            curInput.txid = iter.uint256Data();
+            content = iter.next(Tx::PrevTxIndex);
+            if (content != Tx::PrevTxIndex)
+                throw std::runtime_error("Failed to find PrevTxIndex");
+            curInput.index = iter.intData();
+            inputs.push_back(curInput);
+        }
+        else if (content == Tx::OutputValue) {
+            break;
+        }
+        content = iter.next();
+    }
+    return inputs;
+}
+
 }
 
 Importer::Importer(QObject *parent)
@@ -74,7 +105,10 @@ void Importer::start()
             QCoreApplication::exit(2);
             return;
         }
-        int nextStop = 10000;
+
+        if (!m_db.transaction())
+            throw std::runtime_error("Need transaction aware DB");
+        int nextStop = 50000;
         int lastHeight = -1;
         while(true) {
             index = chain.Next(index); // we skip genesis, its not part of the utxo
@@ -84,13 +118,17 @@ void Importer::start()
             parseBlock(index, Blocks::DB::instance()->loadBlock(index->GetBlockPos()));
 
             if (m_txCount.load() > nextStop) {
-                nextStop = m_txCount.load() + 25000;
-                logCritical() << "Finished blocks 0..." << index->nHeight << ", tx count:" << m_txCount.load();
+                nextStop = m_txCount.load() + 50000;
+                logCritical().nospace() << "Finished blocks 0..." << index->nHeight << ", tx count: " << m_txCount.load();
                 logCritical() << "  parseBlocks" << m_parse.load() << "ms";
                 logCritical() << "       select" << m_selects.load() << "ms";
                 logCritical() << "       delete" << m_deletes.load() << "ms";
                 logCritical() << "       insert" << m_inserts.load() << "ms";
+                logCritical() << "    filter-tx" << m_filterTx.load() << "ms";
                 logCritical() << "   Wall-clock" << time.elapsed() << "ms";
+
+                m_db.commit();
+                m_db.transaction();
             }
             if (index->nHeight >= 125000) // thats all for now
                 break;
@@ -149,8 +187,7 @@ bool Importer::createTables()
               "offsetIB INTEGER, "		// byte-offset in block where the tx starts
               "b_height INTEGER "		// block-height
               // ", coinbase BOOLEAN" 	// true if this is a coinbase
-              ")");
-
+              ") WITH (OIDS)");
 
     if (!query.exec(q)) {
         logFatal() << "Failed to create table:" << query.lastError().text();
@@ -169,28 +206,104 @@ void Importer::parseBlock(const CBlockIndex *index, FastBlock block)
         logInfo() << "Parsing block" << index->nHeight << block.createHash();
 
     block.findTransactions();
-    if (!m_db.transaction())
-        throw std::runtime_error("Need transaction aware DB");
+    const auto transactions = block.transactions();
 
-    try {
+    // QList<Tx> ordered; // these need to be done in-order as they spend each other.
+    // QList<Tx> other;   // order is irrelevant.
+    QSet<int> ordered;
+    QTime time;
+    time.start();
+    {
+        /* Filter the transactions.
+        * Transactions by consensus are sequential, tx 2 can't spend a UTXO that is created in tx 3.
+        *
+        * This means that our ordering is Ok, we just want to be able to remove all the transactions
+        * that spend transactions NOT created in this block, which we can then process in parallel.
+        * Notice that the fact that the transactions are sorted now is awesome as that makes the process
+        * much much faster.
+        *
+        * Additionally we check for double-spends. No 2 transactions are allowed to spend the same UTXO inside this block.
+        */
+        typedef boost::unordered_map<uint256, int, Blocks::BlockHashShortener> TXMap;
+        TXMap txMap;
+
+        typedef boost::unordered_map<uint256, std::vector<bool>, Blocks::BlockHashShortener> MiniUTXO;
+        MiniUTXO miniUTXO;
+
         bool first = true;
-        for (auto tx : block.transactions()) {
-            processTx(index, tx, first, tx.offsetInBlock(block));
-            first = false;
+        int txNum = 1;
+        for (auto tx : transactions) {
+            if (first) { // skip coinbase
+                first = false;
+                continue;
+            }
+            uint256 hash = tx.createHash();
+            bool ocd = false; // if true, tx requires order.
+
+            auto i = Tx::Iterator(tx);
+            auto inputs = findInputs(i);
+            for (auto input : inputs) {
+                auto ti = txMap.find(input.txid);
+                if (ti != txMap.end()) {
+                    ocd = true;
+                    /*
+                     * ok, so we spend a tx also in this block.
+                     * to make sure we don't hit a double-spend here I have to actually check the outputs of the prev-tx.
+                     *
+                     * at this time this isn't unit tested, as such you should assume it is broken.
+                     * the point of this code is to make clear how we can avoid processing our transactions serially
+                     * and we can avoid the need for 'rollback()' (when a block fails half-way through) because we
+                     * detect in-block double-spends without touching the DB.
+                     *
+                     * so I can do all sql deletes in one go when the block is done validating.
+                     */
+                    auto prevIter = miniUTXO.find(input.txid);
+                    if (prevIter == miniUTXO.end()) {
+                        /*
+                         *  insert into the miniUTXO the prevtx outputs.
+                         * we **could** have done this at the more logical code-place for all transactions,
+                         * but since we expect less than 1% of the transactions to spend inside of the same block,
+                         * that would waste resources.
+                         */
+                        auto iter = Tx::Iterator(transactions.at(ti->second));
+                        Tx::Component component;
+                        std::vector<bool> outputs;
+                        while (true) {
+                            component = iter.next(Tx::OutputValue);
+                            if (component == Tx::End)
+                                break;
+                            outputs.push_back(iter.longData() > 0);
+                        }
+
+                        prevIter = miniUTXO.insert(std::make_pair(input.txid, outputs)).first;
+
+                        ordered.insert(ti->second);
+                    }
+                    if (prevIter->second.size() <= input.index)
+                        throw std::runtime_error("spending utxo output out of range");
+                    if (prevIter->second[input.index] == false)
+                        throw std::runtime_error("spending utxo in-block double-spend");
+                    prevIter->second[input.index] = false;
+                }
+            }
+
+            if (ocd)
+                ordered.insert(txNum);
+            txMap.insert(std::make_pair(hash, txNum++));
         }
-        m_db.commit();
-    } catch (const std::exception &e) {
-        m_db.rollback();
-        throw;
+    }
+    m_filterTx.fetchAndAddRelaxed(time.elapsed());
+
+    for (size_t i = 0; i < transactions.size(); ++i) {
+        Tx tx = transactions.at(i);
+        // if (ordered.contains(i))
+        processTx(index, tx, i == 0, tx.offsetInBlock(block));
+        // else
+        //   process in thread.
     }
 
     m_txCount.fetchAndAddRelaxed(block.transactions().size());
 }
-
-struct Input {
-    Streaming::ConstBuffer txid;
-    int index;
-};
 
 void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock)
 {
@@ -202,21 +315,12 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
     QTime time;
     time.start();
     {
-        Input curInput;
         auto iter = Tx::Iterator(tx);
-        auto content = iter.next();
+        if (!isCoinbase)
+            inputs = findInputs(iter);
+        auto content = iter.tag();
         while (content != Tx::End) {
-            if (!isCoinbase && content == Tx::PrevTxHash) { // only read inputs for non-coinbase txs
-                curInput.txid = iter.byteData();
-                if (curInput.txid.size() != 32)
-                    throw std::runtime_error("Failed to understand PrevTxHash");
-                content = iter.next(Tx::PrevTxIndex);
-                if (content != Tx::PrevTxIndex)
-                    throw std::runtime_error("Failed to find PrevTxIndex");
-                curInput.index = iter.intData();
-                inputs.push_back(curInput);
-            }
-            else if (content == Tx::OutputValue) {
+            if (content == Tx::OutputValue) {
                 if (iter.longData() > 0)
                     spendableOutputs.append(QVariant(outputCount));
                 outputCount++;
@@ -226,7 +330,7 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
     }
     m_parse.fetchAndAddRelaxed(time.elapsed());
 
-    if (!inputs.empty()){
+    if (!inputs.empty()) {
         time.start();
         QSqlQuery selectQuery(m_db);
         // selectQuery.prepare("select txid_rest, offsetIB, b_height from utxo where txid=:txid and outx=:index");
@@ -234,13 +338,13 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
         QSqlQuery delQuery(m_db);
         delQuery.prepare("delete from utxo where txid=:txid and outx=:index and txid_rest=:txid2");
         for (auto input : inputs) {
-            selectQuery.bindValue(":txid", QVariant(longFromBytes(input.txid)));
+            selectQuery.bindValue(":txid", QVariant(longFromHash(input.txid)));
             selectQuery.bindValue(":index", input.index);
             if (!selectQuery.exec())
                 throw std::runtime_error(selectQuery.lastError().text().toStdString());
 
             bool found = false;
-            QByteArray partialTxId(input.txid.begin() + 7, 25);
+            QByteArray partialTxId(reinterpret_cast<const char*>(input.txid.begin()) + 7, 25);
             while (selectQuery.next()) { // we may get multiple results in case of a short-txid collision.
                 if (selectQuery.value(0) == partialTxId) { // got it!
                     found = true;
@@ -257,13 +361,13 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
             m_selects.fetchAndAddRelaxed(time.elapsed());
             if (!found) {
                 logFatal() << "block" << index->nHeight << "tx" << tx.createHash() << "tries to find input" << HexStr(input.txid) << input.index;
-                logInfo() << "    " << QString::number(longFromBytes(input.txid), 16).toStdString();
+                logInfo() << "    " << QString::number(longFromHash(input.txid), 16).toStdString();
                 throw std::runtime_error("UTXO not found");
             }
 
             time.start();
             // now delete the row we just spent
-            delQuery.bindValue(":txid", QVariant(longFromBytes(input.txid)));
+            delQuery.bindValue(":txid", QVariant(longFromHash(input.txid)));
             delQuery.bindValue(":index", input.index);
             delQuery.bindValue(":txid2", partialTxId);
             if (!delQuery.exec())
