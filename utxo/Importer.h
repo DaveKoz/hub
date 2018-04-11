@@ -43,6 +43,12 @@ private:
     void processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock);
 
     QSqlDatabase m_db;
+
+    QAtomicInt m_selects;
+    QAtomicInt m_inserts;
+    QAtomicInt m_deletes;
+    QAtomicInt m_parse;
+    QAtomicInteger<qint64> m_txCount;
 };
 
 #endif

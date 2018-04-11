@@ -30,6 +30,7 @@
 #include <chainparamsbase.h>
 #include <QVariant>
 #include <QDebug>
+#include <QTime>
 
 namespace {
 quint64 longFromBytes(const Streaming::ConstBuffer &buf) {
@@ -64,6 +65,8 @@ void Importer::start()
         logInfo() << "Reading blocksDB";
         Blocks::DB::instance()->CacheAllBlockInfos();
         logInfo() << "Finding blocks...";
+        QTime time;
+        time.start();
         const auto &chain = Blocks::DB::instance()->headerChain();
         CBlockIndex *index = chain.Genesis();
         if (index == nullptr) {
@@ -78,6 +81,17 @@ void Importer::start()
                 break;
             lastHeight = index->nHeight;
             parseBlock(index, Blocks::DB::instance()->loadBlock(index->GetBlockPos()));
+
+            if (index->nHeight % 10000 == 0) {
+                logCritical() << "Finished blocks 0..." << index->nHeight << ", tx count:" << m_txCount.load();
+                logCritical() << "  parseBlocks" << m_parse.load() << "ms";
+                logCritical() << "       select" << m_selects.load() << "ms";
+                logCritical() << "       delete" << m_deletes.load() << "ms";
+                logCritical() << "       insert" << m_inserts.load() << "ms";
+                logCritical() << "   Wall-clock" << time.elapsed() << "ms";
+            }
+            if (index->nHeight >= 125000) // thats all for now
+                break;
         }
         logCritical() << "Finished with block at height:" << lastHeight;
     } catch (const std::exception &e) {
@@ -135,7 +149,7 @@ bool Importer::createTables()
 
 void Importer::parseBlock(const CBlockIndex *index, FastBlock block)
 {
-    if (index->nHeight % 10000 == 0)
+    if (index->nHeight % 1000 == 0)
         logInfo() << "Parsing block" << index->nHeight << block.createHash();
 
     block.findTransactions();
@@ -153,6 +167,8 @@ void Importer::parseBlock(const CBlockIndex *index, FastBlock block)
         m_db.rollback();
         throw;
     }
+
+    m_txCount.fetchAndAddRelaxed(block.transactions().size());
 }
 
 struct Input {
@@ -167,6 +183,8 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
     std::list<Input> inputs;
     int outputCount = 0;
     QVariantList spendableOutputs;
+    QTime time;
+    time.start();
     {
         Input curInput;
         auto iter = Tx::Iterator(tx);
@@ -190,8 +208,10 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
             content = iter.next();
         }
     }
+    m_parse.fetchAndAddRelaxed(time.elapsed());
 
     if (!inputs.empty()){
+        time.start();
         QSqlQuery selectQuery(m_db);
         // selectQuery.prepare("select txid_rest, offsetIB, b_height from utxo where txid=:txid and outx=:index");
         selectQuery.prepare("select txid_rest from utxo where txid=:txid and outx=:index");
@@ -218,12 +238,14 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
                     break;
                 }
             }
+            m_selects.fetchAndAddRelaxed(time.elapsed());
             if (!found) {
-                // logFatal() << "block" << index->nHeight << "tx" << tx.createHash() << "tries to find input" << HexStr(input.txid) << input.index;
-                // logInfo() << "    " << QString::number(longFromBytes(input.txid), 16).toStdString();
+                logFatal() << "block" << index->nHeight << "tx" << tx.createHash() << "tries to find input" << HexStr(input.txid) << input.index;
+                logInfo() << "    " << QString::number(longFromBytes(input.txid), 16).toStdString();
                 throw std::runtime_error("UTXO not found");
             }
 
+            time.start();
             // now delete the row we just spent
             delQuery.bindValue(":txid", QVariant(longFromBytes(input.txid)));
             delQuery.bindValue(":index", input.index);
@@ -234,6 +256,7 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
                 logFatal() << "Delete UTXO ended up removing" << delQuery.numRowsAffected() << "rows. Should always be 1.";
                 throw std::runtime_error("UTXO delete didn't respond as expected");
             }
+            m_deletes.fetchAndAddRelaxed(time.elapsed());
 #if 0
             // check the delete actually worked.
             if (!selectQuery.exec())
@@ -249,6 +272,7 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
 
     if (spendableOutputs.isEmpty())
         return;
+    time.start();
 
     QString insert("insert into utxo (txid, outx, txid_rest, offsetIB, b_height) VALUES (%1, ?, ?, %2, %3)");
     const uint256 myHash = tx.createHash();
@@ -271,4 +295,5 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
 
     if (!query.execBatch())
         throw std::runtime_error(query.lastError().text().toStdString());
+    m_inserts.fetchAndAddRelaxed(time.elapsed());
 }
