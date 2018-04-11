@@ -33,13 +33,6 @@
 #include <QTime>
 
 namespace {
-/*
-quint64 longFromBytes(const Streaming::ConstBuffer &buf) {
-    assert(buf.size() >= 8);
-    // this is fine as long as you don't change your endiannes accessing the same DB
-    const quint64 *answer = reinterpret_cast<const quint64*>(buf.begin());
-    return answer[0] >> 1;
-} */
 quint64 longFromHash(const uint256 &sha) {
     const quint64 *answer = reinterpret_cast<const quint64*>(sha.begin());
     return answer[0] >> 1;
@@ -187,7 +180,7 @@ bool Importer::createTables()
               "offsetIB INTEGER, "		// byte-offset in block where the tx starts
               "b_height INTEGER "		// block-height
               // ", coinbase BOOLEAN" 	// true if this is a coinbase
-              ") WITH (OIDS)");
+              ")");
 
     if (!query.exec(q)) {
         logFatal() << "Failed to create table:" << query.lastError().text();
@@ -203,13 +196,11 @@ bool Importer::createTables()
 void Importer::parseBlock(const CBlockIndex *index, FastBlock block)
 {
     if (index->nHeight % 1000 == 0)
-        logInfo() << "Parsing block" << index->nHeight << block.createHash();
+        logInfo() << "Parsing block" << index->nHeight << block.createHash() << "tx-count" << m_txCount.load();
 
     block.findTransactions();
     const auto transactions = block.transactions();
 
-    // QList<Tx> ordered; // these need to be done in-order as they spend each other.
-    // QList<Tx> other;   // order is irrelevant.
     QSet<int> ordered;
     QTime time;
     time.start();

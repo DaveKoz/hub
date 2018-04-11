@@ -222,6 +222,11 @@ Tx::Component Tx::Iterator::next(int filter)
     return Tx::End;
 }
 
+Tx::Component Tx::Iterator::tag() const
+{
+    return d->tag();
+}
+
 Tx Tx::Iterator::prevTx() const
 {
     return Tx(Streaming::ConstBuffer(d->m_data.internal_buffer(), d->m_txStart, d->m_currentTokenEnd));
