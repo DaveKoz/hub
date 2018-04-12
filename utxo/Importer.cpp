@@ -180,13 +180,17 @@ bool Importer::createTables()
               "offsetIB INTEGER, "		// byte-offset in block where the tx starts
               "b_height INTEGER "		// block-height
               // ", coinbase BOOLEAN" 	// true if this is a coinbase
-              ")");
+              ") WITH (OIDS)");
 
     if (!query.exec(q)) {
         logFatal() << "Failed to create table:" << query.lastError().text();
         return false;
     }
     if (!query.exec("create index utxo_basic on utxo (txid, outx)")) {
+        logFatal() << "Failed to create index:" << query.lastError().text();
+        return false;
+    }
+    if (!query.exec("create index utxo_oids on utxo (oid)")) {
         logFatal() << "Failed to create index:" << query.lastError().text();
         return false;
     }
@@ -285,21 +289,45 @@ void Importer::parseBlock(const CBlockIndex *index, FastBlock block)
     }
     m_filterTx.fetchAndAddRelaxed(time.elapsed());
 
+    QList<qint64> itemsToDelete;
     for (size_t i = 0; i < transactions.size(); ++i) {
         Tx tx = transactions.at(i);
         // if (ordered.contains(i))
-        processTx(index, tx, i == 0, tx.offsetInBlock(block));
+        itemsToDelete += processTx(index, tx, i == 0, tx.offsetInBlock(block));
         // else
         //   process in thread.
     }
 
+    time.start();
+    QSqlQuery query(m_db);
+    while (!itemsToDelete.isEmpty()) {
+        QByteArray buffer;
+        {
+            QTextStream stream(&buffer);
+            stream << "delete from utxo where oid in (";
+            bool first = true;
+            while (stream.pos() < 500000 && !itemsToDelete.isEmpty()) {
+                if (!first)
+                    stream << ',';
+                stream << itemsToDelete.takeFirst();
+                first = false;
+            }
+            stream << ")";
+        }
+        QString q = QString::fromLatin1(buffer);
+        query.prepare(q);
+
+        if (!query.exec()) {
+            throw std::runtime_error(query.lastError().text().toStdString());
+        }
+    }
+    m_deletes.fetchAndAddRelaxed(time.elapsed());
+
     m_txCount.fetchAndAddRelaxed(block.transactions().size());
 }
 
-void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock)
+QList<qint64> Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock)
 {
-     // TODO return the amount of fee that this transaction generated so we can 'validate' the coinbase.
-
     std::list<Input> inputs;
     int outputCount = 0;
     QVariantList spendableOutputs;
@@ -321,13 +349,11 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
     }
     m_parse.fetchAndAddRelaxed(time.elapsed());
 
+    QList<qint64> rowsToDelete;
     if (!inputs.empty()) {
         time.start();
         QSqlQuery selectQuery(m_db);
-        // selectQuery.prepare("select txid_rest, offsetIB, b_height from utxo where txid=:txid and outx=:index");
-        selectQuery.prepare("select txid_rest from utxo where txid=:txid and outx=:index");
-        QSqlQuery delQuery(m_db);
-        delQuery.prepare("delete from utxo where txid=:txid and outx=:index and txid_rest=:txid2");
+        selectQuery.prepare("select txid_rest, oid from utxo where txid=:txid and outx=:index");
         for (auto input : inputs) {
             selectQuery.bindValue(":txid", QVariant(longFromHash(input.txid)));
             selectQuery.bindValue(":index", input.index);
@@ -356,33 +382,13 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
                 throw std::runtime_error("UTXO not found");
             }
 
-            time.start();
-            // now delete the row we just spent
-            delQuery.bindValue(":txid", QVariant(longFromHash(input.txid)));
-            delQuery.bindValue(":index", input.index);
-            delQuery.bindValue(":txid2", partialTxId);
-            if (!delQuery.exec())
-                throw std::runtime_error("Failed to run the utxo delete query");
-            if (delQuery.numRowsAffected() != 1) {
-                logFatal() << "Delete UTXO ended up removing" << delQuery.numRowsAffected() << "rows. Should always be 1.";
-                throw std::runtime_error("UTXO delete didn't respond as expected");
-            }
-            m_deletes.fetchAndAddRelaxed(time.elapsed());
-#if 0
-            // check the delete actually worked.
-            if (!selectQuery.exec())
-                throw std::runtime_error(selectQuery.lastError().text().toStdString());
-            if (selectQuery.size() > 0)
-                logFatal() << "Still one in the UTXO!";
-            while (selectQuery.next()) {
-                logFatal() << selectQuery.value(0).toString();
-            }
-#endif
+            rowsToDelete.append(selectQuery.value(1).toLongLong());
         }
     }
 
+
     if (spendableOutputs.isEmpty())
-        return;
+        return rowsToDelete;
     time.start();
 
     QString insert("insert into utxo (txid, outx, txid_rest, offsetIB, b_height) VALUES (%1, ?, ?, %2, %3)");
@@ -407,4 +413,6 @@ void Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int o
     if (!query.execBatch())
         throw std::runtime_error(query.lastError().text().toStdString());
     m_inserts.fetchAndAddRelaxed(time.elapsed());
+
+    return rowsToDelete;
 }

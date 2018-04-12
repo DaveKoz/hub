@@ -40,7 +40,7 @@ private:
     bool createTables();
     void parseBlock(const CBlockIndex *index, FastBlock block);
 
-    void processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock);
+    QList<qint64> processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock);
 
     QSqlDatabase m_db;
 
