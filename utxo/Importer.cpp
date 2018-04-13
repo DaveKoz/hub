@@ -113,13 +113,14 @@ void Importer::start()
 
             if (m_txCount.load() > nextStop) {
                 nextStop = m_txCount.load() + 50000;
+                auto elapsed = time.elapsed();
                 logCritical().nospace() << "Finished blocks 0..." << index->nHeight << ", tx count: " << m_txCount.load();
-                logCritical() << "  parseBlocks" << m_parse.load() << "ms";
-                logCritical() << "       select" << m_selects.load() << "ms";
-                logCritical() << "       delete" << m_deletes.load() << "ms";
-                logCritical() << "       insert" << m_inserts.load() << "ms";
-                logCritical() << "    filter-tx" << m_filterTx.load() << "ms";
-                logCritical() << "   Wall-clock" << time.elapsed() << "ms";
+                logCritical() << "  parseBlocks" << m_parse.load() << "ms\t" << (m_parse.load() * 100 / elapsed) << '%';
+                logCritical() << "       select" << m_selects.load() << "ms\t" << (m_selects.load() * 100 / elapsed) << '%';
+                logCritical() << "       delete" << m_deletes.load() << "ms\t" << (m_deletes.load() * 100 / elapsed) << '%';
+                logCritical() << "       insert" << m_inserts.load() << "ms\t" << (m_inserts.load() * 100 / elapsed) << '%';
+                logCritical() << "    filter-tx" << m_filterTx.load() << "ms\t" << (m_filterTx.load() * 100 / elapsed) << '%';
+                logCritical() << "   Wall-clock" << elapsed << "ms";
 
                 m_db.commit();
                 m_db.transaction();
@@ -375,7 +376,6 @@ QList<qint64> Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinba
                     break;
                 }
             }
-            m_selects.fetchAndAddRelaxed(selectTime.elapsed());
             if (!found) {
                 logFatal() << "block" << index->nHeight << "tx" << tx.createHash() << "tries to find input" << HexStr(input.txid) << input.index;
                 logInfo() << "    " << QString::number(longFromHash(input.txid), 16).toStdString();
@@ -384,6 +384,7 @@ QList<qint64> Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinba
 
             rowsToDelete.append(m_selectQuery.value(1).toLongLong());
         }
+        m_selects.fetchAndAddRelaxed(selectTime.elapsed());
     }
 
 
