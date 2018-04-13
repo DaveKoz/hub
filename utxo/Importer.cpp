@@ -24,7 +24,6 @@
 
 #include <QDir>
 #include <QSqlError>
-#include <QSqlQuery>
 #include <QCoreApplication>
 #include <chain.h>
 #include <chainparamsbase.h>
@@ -82,6 +81,8 @@ void Importer::start()
         QCoreApplication::exit(1);
         return;
     }
+    m_selectQuery = QSqlQuery(m_db);
+    m_selectQuery.prepare("select txid_rest, oid from utxo where txid=:txid and outx=:index");
 
     try {
         SelectBaseParams(CBaseChainParams::MAIN);
@@ -351,19 +352,18 @@ QList<qint64> Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinba
 
     QList<qint64> rowsToDelete;
     if (!inputs.empty()) {
-        time.start();
-        QSqlQuery selectQuery(m_db);
-        selectQuery.prepare("select txid_rest, oid from utxo where txid=:txid and outx=:index");
+        QTime selectTime;
+        selectTime.start();
         for (auto input : inputs) {
-            selectQuery.bindValue(":txid", QVariant(longFromHash(input.txid)));
-            selectQuery.bindValue(":index", input.index);
-            if (!selectQuery.exec())
-                throw std::runtime_error(selectQuery.lastError().text().toStdString());
+            m_selectQuery.bindValue(":txid", QVariant(longFromHash(input.txid)));
+            m_selectQuery.bindValue(":index", input.index);
+            if (!m_selectQuery.exec())
+                throw std::runtime_error(m_selectQuery.lastError().text().toStdString());
 
             bool found = false;
             QByteArray partialTxId(reinterpret_cast<const char*>(input.txid.begin()) + 7, 25);
-            while (selectQuery.next()) { // we may get multiple results in case of a short-txid collision.
-                if (selectQuery.value(0) == partialTxId) { // got it!
+            while (m_selectQuery.next()) { // we may get multiple results in case of a short-txid collision.
+                if (m_selectQuery.value(0) == partialTxId) { // got it!
                     found = true;
 
                     // TODO
@@ -375,14 +375,14 @@ QList<qint64> Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinba
                     break;
                 }
             }
-            m_selects.fetchAndAddRelaxed(time.elapsed());
+            m_selects.fetchAndAddRelaxed(selectTime.elapsed());
             if (!found) {
                 logFatal() << "block" << index->nHeight << "tx" << tx.createHash() << "tries to find input" << HexStr(input.txid) << input.index;
                 logInfo() << "    " << QString::number(longFromHash(input.txid), 16).toStdString();
                 throw std::runtime_error("UTXO not found");
             }
 
-            rowsToDelete.append(selectQuery.value(1).toLongLong());
+            rowsToDelete.append(m_selectQuery.value(1).toLongLong());
         }
     }
 

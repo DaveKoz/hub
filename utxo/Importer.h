@@ -20,6 +20,7 @@
 
 #include <QObject>
 #include <QSqlDatabase>
+#include <QSqlQuery>
 
 class Tx;
 class FastBlock;
@@ -50,6 +51,8 @@ private:
     QAtomicInt m_deletes;
     QAtomicInt m_parse;
     QAtomicInteger<qint64> m_txCount;
+
+    QSqlQuery m_selectQuery;
 };
 
 #endif
