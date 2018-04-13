@@ -70,6 +70,7 @@ QString escapeBytes(const unsigned char *data, int length) {
     static const QString answer ("E'\\\\x%1'");
     return answer.arg(QString::fromLatin1(QByteArray(reinterpret_cast<const char*>(data), length).toHex()));
 }
+
 }
 
 Importer::Importer(QObject *parent)
@@ -87,6 +88,8 @@ void Importer::start()
     }
     m_selectQuery = QSqlQuery(m_db);
     m_selectQuery.prepare("select txid_rest, oid from utxo where txid=:txid and outx=:index");
+    m_insertQuery = QSqlQuery(m_db);
+    m_insertQuery.prepare("insert into utxo (txid, outx, txid_rest, offsetIB, b_height) VALUES (?, ?, ?, ?, ?)");
 
     try {
         SelectBaseParams(CBaseChainParams::MAIN);
@@ -295,27 +298,42 @@ void Importer::parseBlock(const CBlockIndex *index, FastBlock block)
     }
     m_filterTx.fetchAndAddRelaxed(time.elapsed());
 
-    QList<qint64> itemsToDelete;
+    ProcessTxResult commandsForallTransactions;
+
     for (size_t i = 0; i < transactions.size(); ++i) {
         Tx tx = transactions.at(i);
-        // if (ordered.contains(i))
-        itemsToDelete += processTx(index, tx, i == 0, tx.offsetInBlock(block));
-        // else
-        //   process in thread.
+        if (ordered.contains(i))
+            commandsForallTransactions.rowsToDelete += processTx(index, tx, i == 0, tx.offsetInBlock(block), true).rowsToDelete;
+        else
+            //   process in thread. ??
+            commandsForallTransactions += processTx(index, tx, i == 0, tx.offsetInBlock(block), false);
     }
+
+    Q_ASSERT(commandsForallTransactions.outx.size() > 0); // at minimum the coinbase has an output.
+
+    time.start();
+    m_insertQuery.addBindValue(commandsForallTransactions.txid);
+    m_insertQuery.addBindValue(commandsForallTransactions.outx);
+    m_insertQuery.addBindValue(commandsForallTransactions.txid2);
+    m_insertQuery.addBindValue(commandsForallTransactions.offsetInBlock);
+    m_insertQuery.addBindValue(commandsForallTransactions.blockHeight);
+    if (!m_insertQuery.execBatch())
+        throw std::runtime_error(m_insertQuery.lastError().text().toStdString());
+
+    m_inserts.fetchAndAddRelaxed(time.elapsed());
 
     time.start();
     QSqlQuery query(m_db);
-    while (!itemsToDelete.isEmpty()) {
+    while (!commandsForallTransactions.rowsToDelete.isEmpty()) {
         QByteArray buffer;
         {
             QTextStream stream(&buffer);
             stream << "delete from utxo where oid in (";
             bool first = true;
-            while (stream.pos() < 500000 && !itemsToDelete.isEmpty()) {
+            while (stream.pos() < 500000 && !commandsForallTransactions.rowsToDelete.isEmpty()) {
                 if (!first)
                     stream << ',';
-                stream << itemsToDelete.takeFirst();
+                stream << commandsForallTransactions.rowsToDelete.takeFirst();
                 first = false;
             }
             stream << ")";
@@ -332,11 +350,11 @@ void Importer::parseBlock(const CBlockIndex *index, FastBlock block)
     m_txCount.fetchAndAddRelaxed(block.transactions().size());
 }
 
-QList<qint64> Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock)
+Importer::ProcessTxResult Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock, bool insertDirect)
 {
     std::list<Input> inputs;
     int outputCount = 0;
-    QVariantList spendableOutputs;
+    ProcessTxResult result;
     QTime time;
     time.start();
     {
@@ -347,7 +365,7 @@ QList<qint64> Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinba
         while (content != Tx::End) {
             if (content == Tx::OutputValue) {
                 if (iter.longData() > 0)
-                    spendableOutputs.append(QVariant(outputCount));
+                    result.outx.append(QVariant(outputCount));
                 outputCount++;
             }
             content = iter.next();
@@ -355,7 +373,6 @@ QList<qint64> Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinba
     }
     m_parse.fetchAndAddRelaxed(time.elapsed());
 
-    QList<qint64> rowsToDelete;
     if (!inputs.empty()) {
         QTime selectTime;
         selectTime.start();
@@ -386,30 +403,50 @@ QList<qint64> Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinba
                 throw std::runtime_error("UTXO not found");
             }
 
-            rowsToDelete.append(m_selectQuery.value(1).toLongLong());
+            result.rowsToDelete.append(m_selectQuery.value(1).toLongLong());
         }
         m_selects.fetchAndAddRelaxed(selectTime.elapsed());
     }
 
-
-    if (spendableOutputs.isEmpty())
-        return rowsToDelete;
-    time.start();
-
-    static const QString insertBase("insert into utxo (txid, outx, txid_rest, offsetIB, b_height) VALUES (%1, ?, %2, %3, %4)");
     const uint256 myHash = tx.createHash();
-    QString insert = insertBase.arg(longFromHash(myHash));
-    insert = insert.arg(escapeBytes(myHash.begin() + 7, 25));
-    insert = insert.arg(offsetInBlock);
-    insert = insert.arg(index->nHeight);
+    const auto txid = longFromHash(myHash);
+    const QByteArray txid2(reinterpret_cast<const char*>(myHash.begin()) + 7, 25);
+    for (int i = 0; i < result.outx.size(); ++i) {
+        result.blockHeight.append(index->nHeight);
+        result.offsetInBlock.append(offsetInBlock);
+        result.txid.append(txid);
+        result.txid2.append(txid2);
+    }
 
-    QSqlQuery query(m_db);
-    query.prepare(insert);
-    query.addBindValue(spendableOutputs);
+    if (insertDirect) {
+        time.start();
+        // other transactions in this block require these to be in the DB
+        m_insertQuery.addBindValue(result.txid);
+        m_insertQuery.addBindValue(result.outx);
+        m_insertQuery.addBindValue(result.txid2);
+        m_insertQuery.addBindValue(result.offsetInBlock);
+        m_insertQuery.addBindValue(result.blockHeight);
+        if (!m_insertQuery.execBatch())
+            throw std::runtime_error(m_insertQuery.lastError().text().toStdString());
 
-    if (!query.execBatch())
-        throw std::runtime_error(query.lastError().text().toStdString());
-    m_inserts.fetchAndAddRelaxed(time.elapsed());
+        result.blockHeight.clear();
+        result.offsetInBlock.clear();
+        result.txid.clear();
+        result.txid2.clear();
+        result.outx.clear();
+        m_inserts.fetchAndAddRelaxed(time.elapsed());
+    }
 
-    return rowsToDelete;
+    return result;
+}
+
+Importer::ProcessTxResult &Importer::ProcessTxResult::operator+=(const Importer::ProcessTxResult &other)
+{
+    txid += other.txid;
+    txid2 += other.txid2;
+    offsetInBlock += other.offsetInBlock;
+    blockHeight += other.blockHeight;
+    rowsToDelete += other.rowsToDelete;
+    outx += other.outx;
+    return *this;
 }

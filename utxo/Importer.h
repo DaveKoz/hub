@@ -41,7 +41,14 @@ private:
     bool createTables();
     void parseBlock(const CBlockIndex *index, FastBlock block);
 
-    QList<qint64> processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock);
+    struct ProcessTxResult {
+        // the things we want to insert
+        QVariantList txid, outx, txid2, offsetInBlock, blockHeight;
+        QList<qint64> rowsToDelete;
+
+        ProcessTxResult &operator+=(const ProcessTxResult &other);
+    };
+    ProcessTxResult processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock, bool insertDirect);
 
     QSqlDatabase m_db;
 
@@ -52,7 +59,7 @@ private:
     QAtomicInt m_parse;
     QAtomicInteger<qint64> m_txCount;
 
-    QSqlQuery m_selectQuery;
+    QSqlQuery m_selectQuery, m_insertQuery;
 };
 
 #endif
