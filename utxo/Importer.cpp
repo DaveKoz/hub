@@ -30,6 +30,8 @@
 #include <QVariant>
 #include <QDebug>
 #include <QTime>
+#include <QFuture>
+#include <QtConcurrent/QtConcurrent>
 
 namespace {
 quint64 longFromHash(const uint256 &sha) {
@@ -71,12 +73,70 @@ QString escapeBytes(const unsigned char *data, int length) {
     return answer.arg(QString::fromLatin1(QByteArray(reinterpret_cast<const char*>(data), length).toHex()));
 }
 
+struct MapArg {
+    Importer *o;
+    const CBlockIndex *index;
+    Tx tx;
+    bool cb;
+    qint64 oib;
+};
+
+Importer::ProcessTxResult mapFunction(const MapArg &t)
+{
+    try {
+        return t.o->processTx(t.index, t.tx, t.cb, t.oib, Importer::ReturnInserts);
+    } catch (const std::exception &e) {
+        logFatal() << e;
+        throw;
+    }
+}
+
+void reduceFunction(Importer::ProcessTxResult &result, const Importer::ProcessTxResult &intermediate)
+{
+    result += intermediate;
+}
+
+
+QSqlDatabase openDB()
+{
+#if 0
+    QSqlDatabase db = QSqlDatabase::addDatabase("QMYSQL");
+    if (!db.isValid()) {
+        logFatal() << "Unknown database-type. MYSQL. Missing QSql plugins?";
+        logCritical() << db.lastError().text();
+        return false;
+    }
+    db.setConnectOptions(QString("UNIX_SOCKET=%1").arg(QDir::homePath() + "/utxo-test/mysqld.sock"));
+    db.setDatabaseName("utxo");
+    db.setUserName("root");
+#else
+    QSqlDatabase db = QSqlDatabase::addDatabase("QPSQL", QString::number(QSqlDatabase::connectionNames().size()));
+    logCritical() << "Created a new DB connection" << QSqlDatabase::connectionNames().size();
+    if (!db.isValid()) {
+        logFatal() << "Unknown database-type. PSQL. Missing QSql plugins?";
+        logCritical() << db.lastError().text();
+        return db;
+    }
+    db.setDatabaseName("utxo");
+    db.setUserName("utxo");
+#endif
+    db.setHostName("localhost");
+    return db;
+}
+}
+
+
+Importer::ThreadDB::ThreadDB()
+{
+    db = openDB();
+    db.open();
+    query = QSqlQuery(db);
+    query.prepare("select txid_rest, oid from utxo where txid=:txid and outx=:index");
 }
 
 Importer::Importer(QObject *parent)
     : QObject(parent)
 {
-
 }
 
 void Importer::start()
@@ -128,12 +188,12 @@ void Importer::start()
                 logCritical() << "       insert" << m_inserts.load() << "ms\t" << (m_inserts.load() * 100 / elapsed) << '%';
                 logCritical() << "    filter-tx" << m_filterTx.load() << "ms\t" << (m_filterTx.load() * 100 / elapsed) << '%';
                 logCritical() << "   Wall-clock" << elapsed << "ms";
-
-                m_db.commit();
-                m_db.transaction();
             }
+            bool ok = m_db.commit();
+            Q_ASSERT(ok);
             if (index->nHeight >= 125000) // thats all for now
                 break;
+            m_db.transaction();
         }
         logCritical() << "Finished with block at height:" << lastHeight;
     } catch (const std::exception &e) {
@@ -146,27 +206,7 @@ void Importer::start()
 
 bool Importer::initDb()
 {
-#if 0
-    m_db = QSqlDatabase::addDatabase("QMYSQL");
-    if (!m_db.isValid()) {
-        logFatal() << "Unknown database-type. MYSQL. Missing QSql plugins?";
-        logCritical() << m_db.lastError().text();
-        return false;
-    }
-    m_db.setConnectOptions(QString("UNIX_SOCKET=%1").arg(QDir::homePath() + "/utxo-test/mysqld.sock"));
-    m_db.setDatabaseName("utxo");
-    m_db.setUserName("root");
-#else
-    m_db = QSqlDatabase::addDatabase("QPSQL");
-    if (!m_db.isValid()) {
-        logFatal() << "Unknown database-type. PSQL. Missing QSql plugins?";
-        logCritical() << m_db.lastError().text();
-        return false;
-    }
-    m_db.setDatabaseName("utxo");
-    m_db.setUserName("utxo");
-#endif
-    m_db.setHostName("localhost");
+    m_db = openDB();
     if (m_db.isValid() && m_db.open()) {
         return createTables();
     } else {
@@ -217,7 +257,7 @@ void Importer::parseBlock(const CBlockIndex *index, FastBlock block)
     QSet<int> ordered;
     QTime time;
     time.start();
-    {
+    if (transactions.size() > 1) {
         /* Filter the transactions.
         * Transactions by consensus are sequential, tx 2 can't spend a UTXO that is created in tx 3.
         *
@@ -300,14 +340,23 @@ void Importer::parseBlock(const CBlockIndex *index, FastBlock block)
 
     ProcessTxResult commandsForallTransactions;
 
+    QList<MapArg> unorderedTx;
     for (size_t i = 0; i < transactions.size(); ++i) {
-        Tx tx = transactions.at(i);
-        if (ordered.contains(i))
-            commandsForallTransactions.rowsToDelete += processTx(index, tx, i == 0, tx.offsetInBlock(block), true).rowsToDelete;
-        else
-            //   process in thread. ??
-            commandsForallTransactions += processTx(index, tx, i == 0, tx.offsetInBlock(block), false);
+        if (!ordered.contains(i)) {
+            Tx tx = transactions.at(i);
+            unorderedTx.append(MapArg {this, index, tx, i == 0, tx.offsetInBlock(block) });
+       }
     }
+    QFuture<ProcessTxResult> processedTx = QtConcurrent::mappedReduced(unorderedTx, mapFunction, reduceFunction);
+
+    QList<int> sorted(ordered.toList());
+    std::sort(sorted.begin(), sorted.end());
+    for (int i : sorted) {
+        Tx tx = transactions.at(i);
+        commandsForallTransactions.rowsToDelete += processTx(index, tx, i == 0, tx.offsetInBlock(block), InsertDirect).rowsToDelete;
+    }
+    processedTx.waitForFinished();
+    commandsForallTransactions  += processedTx;
 
     Q_ASSERT(commandsForallTransactions.outx.size() > 0); // at minimum the coinbase has an output.
 
@@ -350,8 +399,13 @@ void Importer::parseBlock(const CBlockIndex *index, FastBlock block)
     m_txCount.fetchAndAddRelaxed(block.transactions().size());
 }
 
-Importer::ProcessTxResult Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock, bool insertDirect)
+Importer::ProcessTxResult Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock, Direct direct)
 {
+    if (!m_selectStorage.hasLocalData() && direct == ReturnInserts)
+        m_selectStorage.setLocalData(new ThreadDB());
+
+    QSqlQuery &query = direct == InsertDirect ? m_selectQuery : m_selectStorage.localData()->query;
+
     std::list<Input> inputs;
     int outputCount = 0;
     ProcessTxResult result;
@@ -377,15 +431,15 @@ Importer::ProcessTxResult Importer::processTx(const CBlockIndex *index, Tx tx, b
         QTime selectTime;
         selectTime.start();
         for (auto input : inputs) {
-            m_selectQuery.bindValue(":txid", QVariant(longFromHash(input.txid)));
-            m_selectQuery.bindValue(":index", input.index);
-            if (!m_selectQuery.exec())
-                throw std::runtime_error(m_selectQuery.lastError().text().toStdString());
+            query.bindValue(":txid", QVariant(longFromHash(input.txid)));
+            query.bindValue(":index", input.index);
+            if (!query.exec())
+                throw std::runtime_error(query.lastError().text().toStdString());
 
             bool found = false;
             QByteArray partialTxId(reinterpret_cast<const char*>(input.txid.begin()) + 7, 25);
-            while (m_selectQuery.next()) { // we may get multiple results in case of a short-txid collision.
-                if (m_selectQuery.value(0) == partialTxId) { // got it!
+            while (query.next()) { // we may get multiple results in case of a short-txid collision.
+                if (query.value(0) == partialTxId) { // got it!
                     found = true;
 
                     // TODO
@@ -398,12 +452,12 @@ Importer::ProcessTxResult Importer::processTx(const CBlockIndex *index, Tx tx, b
                 }
             }
             if (!found) {
-                logFatal() << "block" << index->nHeight << "tx" << tx.createHash() << "tries to find input" << HexStr(input.txid) << input.index;
+                logFatal() << "block" << index->nHeight << "tx" << tx.createHash() << "tries to find input" << input.txid << input.index;
                 logInfo() << "    " << QString::number(longFromHash(input.txid), 16).toStdString();
                 throw std::runtime_error("UTXO not found");
             }
 
-            result.rowsToDelete.append(m_selectQuery.value(1).toLongLong());
+            result.rowsToDelete.append(query.value(1).toLongLong());
         }
         m_selects.fetchAndAddRelaxed(selectTime.elapsed());
     }
@@ -418,7 +472,7 @@ Importer::ProcessTxResult Importer::processTx(const CBlockIndex *index, Tx tx, b
         result.txid2.append(txid2);
     }
 
-    if (insertDirect) {
+    if (direct == InsertDirect) {
         time.start();
         // other transactions in this block require these to be in the DB
         m_insertQuery.addBindValue(result.txid);

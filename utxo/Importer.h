@@ -21,6 +21,7 @@
 #include <QObject>
 #include <QSqlDatabase>
 #include <QSqlQuery>
+#include <QThreadStorage>
 
 class Tx;
 class FastBlock;
@@ -32,6 +33,19 @@ class Importer : public QObject
 public:
     Importer(QObject *parent = nullptr);
 
+    struct ProcessTxResult {
+        // the things we want to insert
+        QVariantList txid, outx, txid2, offsetInBlock, blockHeight;
+        QList<qint64> rowsToDelete;
+
+        ProcessTxResult &operator+=(const ProcessTxResult &other);
+    };
+
+    enum Direct {
+        InsertDirect,
+        ReturnInserts
+    };
+    ProcessTxResult processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock, Direct insertDirect);
 
 public slots:
     void start();
@@ -41,14 +55,6 @@ private:
     bool createTables();
     void parseBlock(const CBlockIndex *index, FastBlock block);
 
-    struct ProcessTxResult {
-        // the things we want to insert
-        QVariantList txid, outx, txid2, offsetInBlock, blockHeight;
-        QList<qint64> rowsToDelete;
-
-        ProcessTxResult &operator+=(const ProcessTxResult &other);
-    };
-    ProcessTxResult processTx(const CBlockIndex *index, Tx tx, bool isCoinbase, int offsetInBlock, bool insertDirect);
 
     QSqlDatabase m_db;
 
@@ -60,6 +66,13 @@ private:
     QAtomicInteger<qint64> m_txCount;
 
     QSqlQuery m_selectQuery, m_insertQuery;
+
+    struct ThreadDB {
+        ThreadDB();
+        QSqlDatabase db;
+        QSqlQuery query;
+    };
+    QThreadStorage<ThreadDB*> m_selectStorage;
 };
 
 #endif

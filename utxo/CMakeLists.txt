@@ -24,6 +24,9 @@ set(CMAKE_AUTOUIC ON)
 add_definitions(-DLOG_DEFAULT_SECTION=19000)
 
 find_package(Qt5Sql)
+if (NOT ${Qt5Sql_FOUND})
+    message("Missing qt5 (sql) library, not building utxo research app")
+endif()
 
 include_directories(. ${LIBS_INCLUDES})
 
@@ -48,10 +51,16 @@ set (UTXO_SOURCES
     Importer.cpp
 )
 
-if (${Qt5Sql_FOUND})
+
+find_package(Qt5Concurrent)
+if (NOT ${Qt5Concurrent_FOUND})
+    message("Missing qt5 (concurrent) library, not building utxo research app")
+endif()
+
+if (${Qt5Sql_FOUND} AND ${Qt5Concurrent_FOUND})
     add_executable(utxo-research ${UTXO_SOURCES})
 
-    target_link_libraries(utxo-research ${UTXO_LIBS} Qt5::Sql)
+    target_link_libraries(utxo-research ${UTXO_LIBS} Qt5::Sql Qt5Concurrent)
 endif ()
 
 
