@@ -391,9 +391,9 @@ QList<qint64> Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinba
         return rowsToDelete;
     time.start();
 
-    QString insert("insert into utxo (txid, outx, txid_rest, offsetIB, b_height) VALUES (%1, ?, ?, %2, %3)");
+    static const QString insertBase("insert into utxo (txid, outx, txid_rest, offsetIB, b_height) VALUES (%1, ?, ?, %2, %3)");
     const uint256 myHash = tx.createHash();
-    insert = insert.arg(longFromHash(myHash));
+    QString insert = insertBase.arg(longFromHash(myHash));
     insert = insert.arg(offsetInBlock);
     insert = insert.arg(index->nHeight);
 
