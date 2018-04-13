@@ -66,6 +66,10 @@ std::list<Input> findInputs(Tx::Iterator &iter) {
     return inputs;
 }
 
+QString escapeBytes(const unsigned char *data, int length) {
+    static const QString answer ("E'\\\\x%1'");
+    return answer.arg(QString::fromLatin1(QByteArray(reinterpret_cast<const char*>(data), length).toHex()));
+}
 }
 
 Importer::Importer(QObject *parent)
@@ -392,24 +396,16 @@ QList<qint64> Importer::processTx(const CBlockIndex *index, Tx tx, bool isCoinba
         return rowsToDelete;
     time.start();
 
-    static const QString insertBase("insert into utxo (txid, outx, txid_rest, offsetIB, b_height) VALUES (%1, ?, ?, %2, %3)");
+    static const QString insertBase("insert into utxo (txid, outx, txid_rest, offsetIB, b_height) VALUES (%1, ?, %2, %3, %4)");
     const uint256 myHash = tx.createHash();
     QString insert = insertBase.arg(longFromHash(myHash));
+    insert = insert.arg(escapeBytes(myHash.begin() + 7, 25));
     insert = insert.arg(offsetInBlock);
     insert = insert.arg(index->nHeight);
-
-    // ok, this looks a bit ugly. I don't know how to insert a byte-array in sql, so I'll just do this the hard way for now.
-    const QByteArray txid2(reinterpret_cast<const char*>(myHash.begin()) + 7, 25);
-    QVariantList txid2_list;
-    for (int i = 0; i < spendableOutputs.length(); ++i) {
-        txid2_list.append(txid2);
-        // logInfo() << "insert" << QString::number(longFromHash(myHash), 16).toStdString() << "/" << HexStr(txid2) << spendableOutputs.at(i).toInt();
-    }
 
     QSqlQuery query(m_db);
     query.prepare(insert);
     query.addBindValue(spendableOutputs);
-    query.addBindValue(txid2_list);
 
     if (!query.execBatch())
         throw std::runtime_error(query.lastError().text().toStdString());
